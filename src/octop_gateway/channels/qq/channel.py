@@ -207,6 +207,7 @@ class QQConfig(ChannelConfig):
     sandbox: bool = False
     intents: int | None = None
     c2c_streaming: bool = True
+    social_trigger_enabled: bool = True
     show_tool_hints: bool = False
     stream_throttle_ms: int = 150
     stream_hold_keepalive_s: float = 3.0
@@ -240,6 +241,11 @@ class QQConfig(ChannelConfig):
             # ``c2c_streaming: false`` remains the only opt-out.
             config.c2c_streaming = True
         raw_group_context = data.get("group_context")
+        if isinstance(raw_group_context, dict):
+            social_trigger_enabled = raw_group_context.get("social_trigger_enabled", True)
+            if type(social_trigger_enabled) is not bool:
+                raise ValueError("social_trigger_enabled must be a boolean")
+            config.social_trigger_enabled = social_trigger_enabled
         if isinstance(raw_group_context, dict) and "enabled" not in raw_group_context:
             config.group_context.enabled = True
         if isinstance(raw_group_context, dict) and "owner_commands_only" not in raw_group_context:
@@ -277,6 +283,11 @@ class QQChannel(BaseChannel):
     """
 
     channel_type = "qq"
+
+    @property
+    def social_trigger_enabled(self) -> bool:
+        """Whether the QQ channel permits the optional group participation plugin."""
+        return self._config.social_trigger_enabled
 
     def __init__(
         self,
@@ -1095,6 +1106,8 @@ class QQChannel(BaseChannel):
             "sender_id": sender_id,
             "sender_name": sender_name,
         }
+        if isinstance(sender, dict) and type(sender.get("bot")) is bool:
+            metadata["sender_is_bot"] = sender["bot"]
         if is_group:
             metadata["conversation_id"] = conversation_id
             metadata["bot_mentioned"] = self._is_bot_mentioned(data, event_type)

@@ -97,6 +97,7 @@ class ChannelManager:
         on_pre_lock: PreLockHandler | None = None,
         control_message_predicate: MessagePredicate | None = None,
         interrupt_message_predicate: MessagePredicate | None = None,
+        inbound_handler: Any | None = None,
     ) -> None:
         self._channels: dict[str, BaseChannel] = channels or {}
         self._workers_per_channel = workers_per_channel
@@ -107,6 +108,7 @@ class ChannelManager:
         self._on_pre_lock = on_pre_lock
         self._control_message_predicate = control_message_predicate
         self._interrupt_message_predicate = interrupt_message_predicate
+        self._inbound_handler = inbound_handler
 
         # Per-channel queues and workers
         self._queues: dict[str, asyncio.Queue[Any]] = {}
@@ -729,6 +731,23 @@ class ChannelManager:
                 if not channel.group_context_manager.accepts(message):
                     continue
                 session_key = channel.get_debounce_key(message)
+                if self._inbound_handler is not None:
+                    async def dispatch(item: InboundMessage, *, activate: bool = False, receipt: Any | None = None) -> Any:
+                        # Delayed work must not revive a removed/replaced channel.
+                        if self._channels.get(channel_id) is not channel or not self._running:
+                            return None
+                        async with self._session_lock(channel_id, channel.get_debounce_key(item)):
+                            if self._channels.get(channel_id) is not channel or not self._running:
+                                return None
+                            return await channel.handle_inbound(item, force_activation=activate, receipt=receipt)
+                    try:
+                        if await self._inbound_handler(channel, message, dispatch):
+                            continue
+                    except Exception:
+                        logger.warning("inbound admission handler failed: channel=%s", channel_id)
+                        # Host commands, direct messages and mentions retain native routing.
+                        if channel.group_context_manager.handles(message) and not message.metadata.get("bot_mentioned") and not message.text.lstrip().startswith("/"):
+                            continue
 
                 # Drain additional same-session items from queue
                 batch = [message]
