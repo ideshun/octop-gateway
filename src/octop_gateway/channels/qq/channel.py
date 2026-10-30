@@ -18,6 +18,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Self
+from urllib.parse import quote
 
 from octop_gateway.channel import BaseChannel, ChannelConfig, MessageProcessor
 from octop_gateway.channels.qq.login_qr import QQBotQRCredentials
@@ -1585,6 +1586,27 @@ class QQChannel(BaseChannel):
             headers["Content-Type"] = "application/json"
             status, body = await _do(headers)
         return status, body
+
+    async def get_group_info(self, group_openid: str) -> dict[str, Any]:
+        """Fetch public group metadata, including its name, from QQ's Bot API."""
+        http = await self._ensure_http()
+        url = f"{self._api_base}/v2/groups/{quote(group_openid, safe='')}/info"
+
+        async def _do(headers: dict[str, str]) -> tuple[int, str]:
+            async with http.get(url, headers=headers) as resp:
+                return resp.status, await resp.text()
+
+        headers = await self._fresh_auth_headers()
+        status, body = await _do(headers)
+        if self._is_access_token_error(status, body):
+            self._invalidate_access_token()
+            status, body = await _do(await self._fresh_auth_headers())
+        if status != 200:
+            raise RuntimeError(f"QQ group info lookup failed: HTTP {status}")
+        data = json.loads(body)
+        if not isinstance(data, dict):
+            raise RuntimeError("QQ group info lookup returned an invalid response")
+        return data
 
     async def _ensure_access_token(self) -> str:
         """Ensure a valid OAuth2 access token is available.
