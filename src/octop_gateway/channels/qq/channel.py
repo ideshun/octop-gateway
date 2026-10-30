@@ -208,6 +208,7 @@ class QQConfig(ChannelConfig):
     intents: int | None = None
     c2c_streaming: bool = True
     social_trigger_enabled: bool = True
+    plugin_group_settings: dict[str, bool] = field(default_factory=dict)
     show_tool_hints: bool = False
     stream_throttle_ms: int = 150
     stream_hold_keepalive_s: float = 3.0
@@ -241,7 +242,11 @@ class QQConfig(ChannelConfig):
             # ``c2c_streaming: false`` remains the only opt-out.
             config.c2c_streaming = True
         raw_group_context = data.get("group_context")
+        config.plugin_group_settings = {}
         if isinstance(raw_group_context, dict):
+            config.plugin_group_settings = {
+                key: value for key, value in raw_group_context.items() if isinstance(key, str) and type(value) is bool
+            }
             social_trigger_enabled = raw_group_context.get("social_trigger_enabled", True)
             if type(social_trigger_enabled) is not bool:
                 raise ValueError("social_trigger_enabled must be a boolean")
@@ -288,6 +293,11 @@ class QQChannel(BaseChannel):
     def social_trigger_enabled(self) -> bool:
         """Whether the QQ channel permits the optional group participation plugin."""
         return self._config.social_trigger_enabled
+
+    @property
+    def plugin_group_settings(self) -> dict[str, bool]:
+        """Return a copy of the QQ group-policy switches available to plugins."""
+        return self._config.plugin_group_settings.copy()
 
     def __init__(
         self,
