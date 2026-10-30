@@ -276,3 +276,7 @@ make all              # 格式化 + 类型检查 + 测试
 <a href="https://github.com/TencentCloud/octop-gateway/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=TencentCloud/octop-gateway" />
 </a>
+
+## 入站插件与 QQ 群资料
+
+宿主可注册逐条消息的前置处理钩子，并查询具备平台白名单权限的 QQ 群资料。接口、取消行为和频控见[使用说明](docs/inbound-admission.md)。

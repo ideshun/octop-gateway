@@ -61,7 +61,7 @@ class InboundReceipt:
 
 
 _inbound_receipt: ContextVar[InboundReceipt | None] = ContextVar("inbound_receipt", default=None)
-
+_inbound_activation: ContextVar[bool] = ContextVar("inbound_activation", default=False)
 
 
 # ---------------------------------------------------------------------------
@@ -750,7 +750,7 @@ class BaseChannel(ABC):
     # Message processing pipeline
     # =========================================================================
 
-    async def handle_inbound(self, raw_payload: object, *, force_activation: bool = False, receipt: InboundReceipt | None = None) -> InboundReceipt:
+    async def handle_inbound(self, raw_payload: object) -> None:
         """Run the shared inbound template around platform-specific delivery.
 
         1. Parse raw payload → InboundMessage
@@ -759,16 +759,24 @@ class BaseChannel(ABC):
         4. Process and deliver events using the channel's output strategy
         5. Finalize the group-context lifecycle after a successful reply
         """
+        prepared = await self._prepare_inbound(raw_payload)
+        if prepared is not None:
+            message, subject = prepared
+            processing_succeeded = await self._process_inbound(message, subject)
+            self._finalize_inbound(message, processing_succeeded=processing_succeeded)
+
+    async def dispatch_inbound(
+        self, raw_payload: object, *, force_activation: bool = False, receipt: InboundReceipt | None = None
+    ) -> InboundReceipt:
+        """Deliver admitted input through the adapter's native inbound strategy."""
         receipt = receipt if receipt is not None else InboundReceipt()
         token = _inbound_receipt.set(receipt)
+        activation_token = _inbound_activation.set(force_activation)
         try:
-            prepared = await self._prepare_inbound(raw_payload, force_activation=force_activation)
-            if prepared is not None:
-                message, subject = prepared
-                processing_succeeded = await self._process_inbound(message, subject)
-                self._finalize_inbound(message, processing_succeeded=processing_succeeded)
+            await self.handle_inbound(raw_payload)
             return receipt
         finally:
+            _inbound_activation.reset(activation_token)
             _inbound_receipt.reset(token)
 
     async def _preprocess_inbound(self, message: InboundMessage) -> None:
@@ -787,6 +795,7 @@ class BaseChannel(ABC):
         force_activation: bool = False,
     ) -> tuple[InboundMessage, ChannelSubject] | None:
         """Prepare one message for any channel-specific output strategy."""
+        force_activation = force_activation or _inbound_activation.get()
         message = self.parse_inbound(raw_payload)
         await self._preprocess_inbound(message)
         if not self._group_context.accepts(message):

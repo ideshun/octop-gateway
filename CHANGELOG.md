@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add per-message pre-agent admission hooks, guarded delayed dispatch and delivery receipts; forced group activation preserves visibility and tool restrictions.
+- Expose QQ group metadata lookup with token refresh, safe platform error codes and a separate 30-request/minute budget per channel.
+
 ### 修复
 
 - 公共群策略的 `owner_commands_only` 默认开启，Python 构造、旧 JSON 配置及群覆盖继承保持一致；白名单为空时禁止全部内置群命令，显式设置 `false` 可关闭保护，普通聊天和私聊不变。

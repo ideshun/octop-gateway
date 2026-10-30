@@ -327,16 +327,22 @@ class GroupContextManager:
         activation, capability_degraded = self._effective_activation(policy)
         if force_activation and policy.visibility is not GroupVisibility.ALL:
             return None
-        should_process = force_activation or activation is GroupActivation.ALWAYS or bool(message.metadata.get("bot_mentioned"))
+        should_process = (
+            force_activation or activation is GroupActivation.ALWAYS or bool(message.metadata.get("bot_mentioned"))
+        )
         if not should_process:
             if policy.visibility is not GroupVisibility.MENTION_ONLY and policy.history is GroupHistoryMode.RECENT:
                 self._append(conversation_id, message, policy)
             return None
 
         platform_messages = message.group_context.messages if message.group_context else []
-        buffered = platform_messages if force_activation else self._merge_messages(
-            platform_messages,
-            list(self._buffers.get(conversation_id, ())),
+        buffered = (
+            platform_messages
+            if force_activation
+            else self._merge_messages(
+                platform_messages,
+                list(self._buffers.get(conversation_id, ())),
+            )
         )
         if self._is_group(message):
             buffered = [item for item in buffered if self._accepts_command(policy, item.text, item.sender_id)]

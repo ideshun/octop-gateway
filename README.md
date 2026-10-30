@@ -372,3 +372,7 @@ registration only, not running instances or persisted configuration.
 `SUPPORTED_CHANNEL_KINDS` remains the builtin compatibility snapshot.
 
 发布接入要求：启用 `owner_tools_only` 的宿主必须透传 `allowed_tools`，并使用已实现回合级工具限制的运行时。Octop 应在新版本中配套升级 gateway 与 harness；单独升级网关不能代表端到端权限限制已生效。
+
+## Pre-agent admission and QQ metadata
+
+Hosts can register per-message admission hooks and query QQ group metadata. See [contracts, permissions and limits](docs/inbound-admission.md).
