@@ -84,6 +84,35 @@ def _qq_subject(subject_id: str, **metadata: str) -> ChannelSubject:
 class TestQQChannelUnit:
     """Unit tests for QQ channel logic (no API calls)."""
 
+    def test_timestamp_rejects_ambiguous_local_time(self) -> None:
+        from datetime import UTC, datetime
+
+        expected = datetime(2026, 11, 2, 9, 12, 8, tzinfo=UTC).timestamp()
+        assert QQChannel._parse_event_timestamp("2026-11-02T17:12:08+08:00") == expected
+        assert QQChannel._parse_event_timestamp("2026-11-02T09:12:08Z") == expected
+        with pytest.raises(ValueError, match="missing a timezone"):
+            QQChannel._parse_event_timestamp("2026-11-02T17:12:08")
+        with pytest.raises(ValueError, match="timestamp is invalid"):
+            QQChannel._parse_event_timestamp("not-a-timestamp")
+        ch = QQChannel(processor=_noop_processor, config=_make_config())
+        with pytest.raises(ValueError, match="missing a timezone"):
+            ch.parse_inbound({"t": "GROUP_MESSAGE_CREATE", "d": {"timestamp": "2026-11-02T17:12:08"}})
+
+    def test_ambiguous_context_timestamp_does_not_drop_current_message(self) -> None:
+        ch = QQChannel(processor=_noop_processor, config=_make_config())
+        payload = {
+            "t": "GROUP_AT_MESSAGE_CREATE",
+            "d": {
+                "id": "current",
+                "content": "hello",
+                "author": {"member_openid": "member"},
+                "group_openid": "group",
+                "timestamp": "2026-11-02T17:12:08+08:00",
+                "msg_elements": [{"content": "old", "timestamp": "2026-11-02T17:10:00"}],
+            },
+        }
+        assert ch.parse_inbound(payload).text == "hello"
+
     def test_config_creation(self) -> None:
         config = _make_config()
         assert config.app_id == _QQ_APP_ID
