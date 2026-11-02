@@ -1868,6 +1868,11 @@ class QQChannel(BaseChannel):
             author = element.get("author")
             author = author if isinstance(author, dict) else {}
             sender_id = str(author.get("member_openid") or author.get("user_openid") or author.get("id") or "unknown")
+            try:
+                timestamp = self._parse_event_timestamp(element.get("timestamp"))
+            except ValueError:
+                logger.warning("QQChannel ignored group context with an invalid or ambiguous timestamp")
+                continue
             messages.append(
                 GroupContextMessage(
                     message_id=str(element.get("id") or element_idx),
@@ -1875,7 +1880,7 @@ class QQChannel(BaseChannel):
                     sender_name=str(author.get("username") or ""),
                     text=text,
                     content=media,
-                    timestamp=self._parse_event_timestamp(element.get("timestamp")),
+                    timestamp=timestamp,
                 )
             )
         if not messages:
@@ -1969,10 +1974,15 @@ class QQChannel(BaseChannel):
         if isinstance(value, int | float):
             return float(value)
         if isinstance(value, str) and value:
-            with contextlib.suppress(ValueError):
-                from datetime import datetime
+            from datetime import datetime
 
-                return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise ValueError("QQ event timestamp is invalid") from exc
+            if parsed.utcoffset() is None:
+                raise ValueError("QQ event timestamp is missing a timezone")
+            return parsed.timestamp()
         return time.time()
 
     @staticmethod
