@@ -6,6 +6,7 @@ import asyncio
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
 from octop_gateway.channel import BaseChannel, InboundReceipt, MessageProcessor, _inbound_receipt
@@ -40,6 +41,13 @@ class InboundDispatch(Protocol):
 
 
 AdmissionHandler = Callable[[BaseChannel, InboundMessage, InboundDispatch], Awaitable[bool]]
+
+
+@dataclass(frozen=True)
+class _QueuedInbound:
+    message: InboundMessage
+    session_key: str
+    generation: int
 
 
 def _config_class_for(channel_cls: type[BaseChannel]) -> type | None:
@@ -117,16 +125,19 @@ class ChannelManager:
         self._on_pre_lock = on_pre_lock
         self._control_message_predicate = control_message_predicate
         self._interrupt_message_predicate = interrupt_message_predicate
+        self._priority_message_predicate: MessagePredicate | None = None
         self._inbound_handler = inbound_handler
 
         # Per-channel queues and workers
         self._queues: dict[str, asyncio.Queue[Any]] = {}
         self._workers: list[asyncio.Task[None]] = []
         self._interrupt_tasks: set[asyncio.Task[None]] = set()
+        self._control_tasks: dict[tuple[str, str], set[asyncio.Task[None]]] = {}
 
         # Session locking: prevent same-session messages from being processed
         # concurrently across workers
         self._session_locks: dict[str, asyncio.Lock] = {}
+        self._session_generations: dict[tuple[str, str], int] = {}
         self._running = False
 
         # Store event loop reference for thread-safe enqueue
@@ -135,6 +146,10 @@ class ChannelManager:
     def set_pre_lock_handler(self, handler: PreLockHandler | None) -> None:
         """Install or clear the pre-session-lock inbound hook."""
         self._on_pre_lock = handler
+
+    def set_priority_message_predicate(self, predicate: MessagePredicate | None) -> None:
+        """Route native controls independently of ordinary session workers."""
+        self._priority_message_predicate = predicate
 
     def set_inbound_handler(self, handler: AdmissionHandler | None) -> None:
         """Set the pre-agent hook; True claims input, False retains native routing.
@@ -221,6 +236,7 @@ class ChannelManager:
         if self._interrupt_tasks:
             await asyncio.gather(*self._interrupt_tasks, return_exceptions=True)
         self._interrupt_tasks.clear()
+        self._control_tasks.clear()
 
         # Stop channels
         for channel_id, channel in self._channels.items():
@@ -233,6 +249,7 @@ class ChannelManager:
 
         self._queues.clear()
         self._session_locks.clear()
+        self._session_generations.clear()
         logger.info("ChannelManager stopped")
 
     # =========================================================================
@@ -291,7 +308,7 @@ class ChannelManager:
         """Thread-safe helper: put payload into queue from the event loop thread."""
         queued_payload = payload
         channel = self._channels.get(channel_id)
-        if channel is not None and self._interrupt_message_predicate is not None:
+        if channel is not None and (self._interrupt_message_predicate or self._priority_message_predicate):
             try:
                 message = channel.parse_inbound(payload)
             except Exception:  # pylint: disable=broad-except
@@ -299,16 +316,31 @@ class ChannelManager:
                 message = None
             if message is not None and not channel.group_context_manager.accepts(message):
                 return
-            if message is not None and self._interrupt_message_predicate(message):
+            interrupt = message is not None and bool(
+                self._interrupt_message_predicate and self._interrupt_message_predicate(message)
+            )
+            priority = message is not None and bool(
+                self._priority_message_predicate and self._priority_message_predicate(message)
+            )
+            if message is not None and (interrupt or priority):
+                key = (channel_id, channel.get_debounce_key(message))
+                if interrupt:
+                    self._session_generations[key] = self._session_generations.get(key, 0) + 1
+                prior = () if interrupt else tuple(self._control_tasks.get(key, ()))
                 task = asyncio.create_task(
-                    self._run_interrupt(channel_id, channel, message),
+                    self._run_interrupt(channel_id, channel, message, prior),
                     name=f"gateway-interrupt-{channel_id}",
                 )
                 self._interrupt_tasks.add(task)
+                self._control_tasks.setdefault(key, set()).add(task)
                 task.add_done_callback(self._interrupt_tasks.discard)
+                task.add_done_callback(lambda done: self._control_done(key, done))
                 return
             if message is not None:
-                queued_payload = message
+                session_key = channel.get_debounce_key(message)
+                queued_payload = _QueuedInbound(
+                    message, session_key, self._session_generations.get((channel_id, session_key), 0)
+                )
         try:
             queue.put_nowait(queued_payload)
         except asyncio.QueueFull:
@@ -319,15 +351,41 @@ class ChannelManager:
         channel_id: str,
         channel: BaseChannel,
         message: InboundMessage,
+        prior: tuple[asyncio.Task[None], ...] = (),
     ) -> None:
-        """Process an urgent control message without waiting for the session lock."""
+        """Process a native control without ordinary session workers or locks."""
+        token = _inbound_receipt.set(InboundReceipt())
         try:
+            if prior:
+                await asyncio.gather(*(asyncio.shield(task) for task in prior))
+            if self._channels.get(channel_id) is not channel or not self._running:
+                return
+            if await self._admit(channel_id, channel, message):
+                return
+            if self._on_pre_lock is not None:
+                await self._on_pre_lock(channel_id, message)
             await channel.handle_inbound(message)
         except asyncio.CancelledError:
             raise
         except Exception:  # pylint: disable=broad-except
             # An urgent control message must not terminate the interrupt worker.
             logger.exception("Interrupt worker error: channel=%s", channel_id)
+        finally:
+            _inbound_receipt.reset(token)
+
+    def _control_done(self, key: tuple[str, str], task: asyncio.Task[None]) -> None:
+        pending = self._control_tasks.get(key)
+        if pending is not None:
+            pending.discard(task)
+            if not pending:
+                self._control_tasks.pop(key, None)
+
+    async def _wait_for_controls(self, channel_id: str, session_key: str) -> None:
+        while pending := self._control_tasks.get((channel_id, session_key)):
+            active = [task for task in pending if not task.done()]
+            if not active:
+                return
+            await asyncio.gather(*(asyncio.shield(task) for task in active))
 
     # =========================================================================
     # Proactive push API
@@ -730,15 +788,23 @@ class ChannelManager:
         handler = self._inbound_handler
         if handler is None:
             return False
+        key = (channel_id, channel.get_debounce_key(message))
+        generation = self._session_generations.get(key, 0)
 
         async def dispatch(
             item: InboundMessage, *, activate: bool = False, receipt: InboundReceipt | None = None
         ) -> InboundReceipt | None:
             if self._channels.get(channel_id) is not channel or not self._running:
                 return None
+            if self._session_generations.get(key, 0) != generation:
+                return receipt
+            if asyncio.current_task() not in self._control_tasks.get(key, ()):
+                await self._wait_for_controls(*key)
             async with self._session_lock(channel_id, channel.get_debounce_key(item)):
                 if self._channels.get(channel_id) is not channel or not self._running:
                     return None
+                if self._session_generations.get(key, 0) != generation:
+                    return receipt
                 return await channel.dispatch_inbound(item, force_activation=activate, receipt=receipt)
 
         try:
@@ -777,11 +843,18 @@ class ChannelManager:
             receipt_token = _inbound_receipt.set(InboundReceipt())
             try:
                 # Parse to get session key for locking
-                message = payload if isinstance(payload, InboundMessage) else channel.parse_inbound(payload)
+                if self._cancelled_queued(channel_id, payload):
+                    channel.on_inbound_claimed(payload.message)
+                    continue
+                raw = payload.message if isinstance(payload, _QueuedInbound) else payload
+                message = raw if isinstance(raw, InboundMessage) else channel.parse_inbound(raw)
                 if not channel.group_context_manager.accepts(message):
                     continue
                 session_key = channel.get_debounce_key(message)
                 if await self._admit(channel_id, channel, message):
+                    continue
+                if self._cancelled_queued(channel_id, payload):
+                    channel.on_inbound_claimed(message)
                     continue
 
                 # Drain additional same-session items from queue
@@ -789,7 +862,9 @@ class ChannelManager:
                 is_control = self._control_message_predicate is not None and self._control_message_predicate(message)
                 if not is_control and channel.should_batch_inbound(message):
                     for item in self._drain_same_session(queue, channel, session_key):
-                        if not await self._admit(channel_id, channel, item):
+                        if self._cancelled_queued(channel_id, payload):
+                            channel.on_inbound_claimed(item)
+                        elif not await self._admit(channel_id, channel, item):
                             batch.append(item)
 
                 # Merge batch if multiple
@@ -808,7 +883,12 @@ class ChannelManager:
                 # Native IDs are only unique inside one registered channel.
                 # Prefix the shared lock registry to avoid cross-account or
                 # cross-platform collisions.
+                await self._wait_for_controls(channel_id, session_key)
                 async with self._session_lock(channel_id, session_key):
+                    if self._cancelled_queued(channel_id, payload):
+                        for item in batch:
+                            channel.on_inbound_claimed(item)
+                        continue
                     # Use handle_inbound which includes delta accumulation,
                     # rate limiting, timeout guard, and typing keepalive
                     await channel.handle_inbound(merged)
@@ -825,6 +905,11 @@ class ChannelManager:
         """Return the shared lock for one registered-channel session."""
         lock_key = f"{channel_id}:{session_key}"
         return self._session_locks.setdefault(lock_key, asyncio.Lock())
+
+    def _cancelled_queued(self, channel_id: str, payload: Any) -> bool:
+        return isinstance(payload, _QueuedInbound) and payload.generation != self._session_generations.get(
+            (channel_id, payload.session_key), 0
+        )
 
     def _drain_same_session(
         self,
@@ -843,7 +928,11 @@ class ChannelManager:
                 break
 
             try:
-                msg = payload if isinstance(payload, InboundMessage) else channel.parse_inbound(payload)
+                if self._cancelled_queued(channel.channel_id, payload):
+                    channel.on_inbound_claimed(payload.message)
+                    continue
+                raw = payload.message if isinstance(payload, _QueuedInbound) else payload
+                msg = raw if isinstance(raw, InboundMessage) else channel.parse_inbound(raw)
                 if not channel.group_context_manager.accepts(msg):
                     continue
                 if self._control_message_predicate is not None and self._control_message_predicate(msg):

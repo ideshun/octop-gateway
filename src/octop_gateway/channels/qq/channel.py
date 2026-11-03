@@ -102,8 +102,8 @@ _IMG_TAG_RE = re.compile(r"<qqimg\s+[^>]*?src\s*=\s*[\"']([^\"']+)[\"'][^>]*?>",
 _VIDEO_TAG_RE = re.compile(r"<qqvideo\s+[^>]*?src\s*=\s*[\"']([^\"']+)[\"'][^>]*?>", re.IGNORECASE)
 _AUDIO_TAG_RE = re.compile(r"<qqaudio\s+[^>]*?src\s*=\s*[\"']([^\"']+)[\"'][^>]*?>", re.IGNORECASE)
 _FILE_TAG_RE = re.compile(r"<qqfile\s+[^>]*?src\s*=\s*[\"']([^\"']+)[\"'][^>]*?>", re.IGNORECASE)
-# Strip @bot mentions
-_AT_MENTION_RE = re.compile(r"<@!?[A-Za-z0-9_-]+>\s*", re.IGNORECASE)
+# Detect addressing before confirmed self mentions are stripped.
+_AT_MENTION_RE = re.compile(r"<@!?[^>]+>")
 _THINK_BLOCK_RE = re.compile(
     r"<(?:think|thinking)>(.*?)</(?:think|thinking)>",
     re.IGNORECASE | re.DOTALL,
@@ -331,6 +331,7 @@ class QQChannel(BaseChannel):
         self._last_sequence: int | None = None
         self._session_id_ws: str | None = None
         self._gateway_url: str | None = None
+        self._bot_user_id: str = ""
 
         # Lifecycle control
         self._running = False
@@ -1102,7 +1103,7 @@ class QQChannel(BaseChannel):
 
         sender_id = self._extract_sender_id(data, event_type)
         session_id = self._resolve_session_from_event(data, event_type)
-        content_parts = self._parse_content(data, event_type=event_type)
+        content_parts = self._parse_content(data)
         msg_type = self._classify_msg_type(event_type)
         is_group = msg_type == "group"
         conversation_id = self._extract_to_handle(data, event_type) if is_group else ""
@@ -1123,6 +1124,11 @@ class QQChannel(BaseChannel):
         if is_group:
             metadata["conversation_id"] = conversation_id
             metadata["bot_mentioned"] = self._is_bot_mentioned(data, event_type)
+            metadata["has_mentions"] = bool(
+                metadata["bot_mentioned"]
+                or data.get("mentions")
+                or _AT_MENTION_RE.search(str(data.get("content") or ""))
+            )
 
         # Carry guild/group/user context for replies
         if "guild_id" in data:
@@ -1259,6 +1265,8 @@ class QQChannel(BaseChannel):
 
             if event_type == "READY":
                 self._session_id_ws = data.get("session_id")
+                user = data.get("user")
+                self._bot_user_id = str(user.get("id") or "") if isinstance(user, dict) else ""
                 # Reconnect succeeded all the way through IDENTIFY → reset
                 # the geometric backoff so a healthy session doesn't carry
                 # an inflated delay from prior failures.
@@ -1675,7 +1683,7 @@ class QQChannel(BaseChannel):
     # Internal: Content parsing helpers
     # =========================================================================
 
-    def _parse_content(self, data: dict[str, object], *, event_type: str = "") -> list[ContentPart]:
+    def _parse_content(self, data: dict[str, object]) -> list[ContentPart]:
         """Parse message content from QQ event data into ContentPart list."""
         parts: list[ContentPart] = []
         raw_content = str(data.get("content") or "")
@@ -1696,7 +1704,7 @@ class QQChannel(BaseChannel):
 
         # Strip media tags and @bot mentions to get clean text
         clean_text = _MEDIA_TAG_RE.sub("", raw_content)
-        clean_text = self._strip_bot_mention(clean_text, data, event_type=event_type)
+        clean_text = self._strip_bot_mention(clean_text, data)
 
         quoted = self._find_quoted_element(data)
         if quoted is not None:
@@ -1770,10 +1778,9 @@ class QQChannel(BaseChannel):
             existing_urls.add(att_url)
         return voice_transcripts
 
-    @staticmethod
-    def _strip_bot_mention(text: str, data: dict[str, object], *, event_type: str) -> str:
-        """Remove only the bot's QQ mention token from agent-facing text."""
-        bot_ids: set[str] = set()
+    def _bot_mention_ids(self, data: dict[str, object]) -> set[str]:
+        """Use authenticated user identity and event-local self markers, never AppID."""
+        bot_ids = {self._bot_user_id} if self._bot_user_id else set()
         mentions = data.get("mentions")
         if isinstance(mentions, list):
             for mention in mentions:
@@ -1783,14 +1790,15 @@ class QQChannel(BaseChannel):
                     value = mention.get(key)
                     if value:
                         bot_ids.add(str(value))
+        return bot_ids
 
+    def _strip_bot_mention(self, text: str, data: dict[str, object]) -> str:
+        """Remove only the bot's QQ mention token from agent-facing text."""
         clean = text
-        for bot_id in bot_ids:
+        for bot_id in self._bot_mention_ids(data):
             token = re.compile(rf"<@!?{re.escape(bot_id)}>\s*", re.IGNORECASE)
             clean = token.sub("", clean)
 
-        if event_type in ("GROUP_AT_MESSAGE_CREATE", "AT_MESSAGE_CREATE"):
-            clean = _AT_MENTION_RE.sub("", clean, count=1)
         return clean.strip()
 
     @staticmethod
@@ -1956,6 +1964,7 @@ class QQChannel(BaseChannel):
         """Use QQ's event/structured mention markers as the source of truth."""
         if event_type == "GROUP_AT_MESSAGE_CREATE":
             return True
+        bot_ids = self._bot_mention_ids(data)
         mentions = data.get("mentions")
         if isinstance(mentions, list):
             for mention in mentions:
@@ -1963,11 +1972,10 @@ class QQChannel(BaseChannel):
                     continue
                 if mention.get("is_you") is True:
                     return True
-                mention_id = mention.get("id") or mention.get("user_openid") or mention.get("member_openid")
-                if mention_id is not None and str(mention_id) == self._config.app_id:
+                if any(str(mention.get(key) or "") in bot_ids for key in ("id", "user_openid", "member_openid")):
                     return True
         content = str(data.get("content") or "")
-        return f"<@!{self._config.app_id}>" in content or f"<@{self._config.app_id}>" in content
+        return any(f"<@!{bot_id}>" in content or f"<@{bot_id}>" in content for bot_id in bot_ids)
 
     @staticmethod
     def _parse_event_timestamp(value: object) -> float:

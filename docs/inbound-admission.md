@@ -24,6 +24,14 @@ Cancellation propagates. Ordinary group input fails closed on hook errors;
 native commands, direct messages and mentions retain normal routing. The default
 without a hook preserves existing batching and routing behavior.
 
+Hosts can call `set_priority_message_predicate(predicate)` for native commands
+that must not wait behind ordinary turns. These commands still pass group
+command authorization and admission, and use a separate, per-session control
+path. `interrupt_message_predicate` additionally invalidates queued ordinary
+messages and previously retained dispatch callbacks in that session; messages
+received after the interrupt remain eligible. Discarded queued messages notify
+the adapter through `on_inbound_claimed` so durable inboxes do not replay them.
+
 After a handler claims input, the manager calls the adapter's synchronous
 `on_inbound_claimed(message)` hook. Durable adapters can release their intake
 slot here; they must preserve an already started or completed message if the
@@ -40,7 +48,20 @@ the native activation check without bypassing sender or command permissions.
 `group_context`, including switches contributed by policy plugins; it does not
 change the platform's message access permissions.
 
+Adapters should also set `has_mentions` before stripping addressing syntax.
+When it is true and `bot_mentioned` is false, the message addresses other
+members rather than this bot. Policy plugins can skip automatic participation
+without guessing a recipient from words such as "bot" in plain text.
+
 ## QQ group metadata
+
+Full-message mode can deliver self mentions as `GROUP_MESSAGE_CREATE` too.
+The adapter uses event-local `mentions[].is_you` and the authenticated
+`READY.user.id` for self recognition and removes only confirmed self tokens.
+AppID is an application credential identifier, not a substitute for member
+identity. Event-local OpenIDs are not cached as global identities. READY adds
+no per-message API requests; when neither source identifies the target, an
+unknown mention is not treated as a confirmed self mention.
 
 `await qq_channel.get_group_info(group_openid)` returns the official QQ response,
 including `group_name`, but not the numeric QQ group number. Only platform-

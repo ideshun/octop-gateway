@@ -277,6 +277,126 @@ class TestChannelManager:
             await mgr.stop()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("workers", [1, 4])
+    async def test_commands_bypass_chat_and_stop_discards_only_prior_session_messages(self, workers: int) -> None:
+        started, release, status_seen, stop_seen, after_seen, other_seen = (asyncio.Event() for _ in range(6))
+        seen = []
+
+        async def processor(msg: InboundMessage) -> AsyncIterator[MessageEvent]:
+            seen.append(msg.text)
+            if msg.text == "work":
+                started.set()
+                await release.wait()
+            elif msg.text == "/status":
+                status_seen.set()
+            elif msg.text == "/stop":
+                release.set()
+                stop_seen.set()
+            elif msg.text == "after":
+                after_seen.set()
+            elif msg.text == "other session":
+                other_seen.set()
+            yield MessageEvent.completed()
+
+        channel = MockChannel(processor)
+        manager = ChannelManager(
+            {channel.channel_id: channel},
+            workers_per_channel=workers,
+            interrupt_message_predicate=lambda msg: msg.text == "/stop",
+        )
+        manager.set_priority_message_predicate(lambda msg: msg.text in ("/status", "/stop"))
+        await manager.start()
+        try:
+            manager.enqueue(channel.channel_id, "work")
+            await asyncio.wait_for(started.wait(), 1)
+            manager.enqueue(channel.channel_id, "discard")
+            manager.enqueue(
+                channel.channel_id,
+                InboundMessage(
+                    channel_id=channel.channel_id,
+                    content=[TextContent(text="other session")],
+                    channel_subject=ChannelSubject(subject_id="user2"),
+                ),
+            )
+            manager.enqueue(channel.channel_id, "/status")
+            await asyncio.wait_for(status_seen.wait(), 1)
+            assert not release.is_set()
+            manager.enqueue(channel.channel_id, "/stop")
+            await asyncio.wait_for(stop_seen.wait(), 1)
+            manager.enqueue(channel.channel_id, "after")
+            await asyncio.wait_for(after_seen.wait(), 1)
+            await asyncio.wait_for(other_seen.wait(), 1)
+            assert "discard" not in seen
+        finally:
+            release.set()
+            await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_stop_invalidates_previously_retained_dispatch(self) -> None:
+        ready, stopped = asyncio.Event(), asyncio.Event()
+        retained = []
+
+        async def admission(channel, message, dispatch):
+            if message.text == "deferred":
+                retained.append((message, dispatch))
+                ready.set()
+                return True
+            return False
+
+        async def processor(message):
+            assert message.text == "/stop"
+            stopped.set()
+            yield MessageEvent.completed()
+
+        channel = MockChannel(processor)
+        manager = ChannelManager(
+            {channel.channel_id: channel},
+            inbound_handler=admission,
+            interrupt_message_predicate=lambda message: message.text == "/stop",
+        )
+        await manager.start()
+        try:
+            manager.enqueue(channel.channel_id, "deferred")
+            await asyncio.wait_for(ready.wait(), 1)
+            manager.enqueue(channel.channel_id, "/stop")
+            await asyncio.wait_for(stopped.wait(), 1)
+            message, dispatch = retained[0]
+            await dispatch(message, activate=True)
+        finally:
+            await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_priority_command_preserves_queued_chat(self) -> None:
+        started, release, command_seen, later_seen = (asyncio.Event() for _ in range(4))
+
+        async def processor(message):
+            if message.text == "work":
+                started.set()
+                await release.wait()
+            elif message.text == "/status":
+                command_seen.set()
+            elif message.text == "later":
+                later_seen.set()
+            yield MessageEvent.completed()
+
+        channel = MockChannel(processor)
+        manager = ChannelManager({channel.channel_id: channel}, workers_per_channel=1)
+        manager.set_priority_message_predicate(lambda message: message.text == "/status")
+        await manager.start()
+        try:
+            manager.enqueue(channel.channel_id, "work")
+            await asyncio.wait_for(started.wait(), 1)
+            manager.enqueue(channel.channel_id, "later")
+            manager.enqueue(channel.channel_id, "/status")
+            await asyncio.wait_for(command_seen.wait(), 1)
+            assert not later_seen.is_set()
+            release.set()
+            await asyncio.wait_for(later_seen.wait(), 1)
+        finally:
+            release.set()
+            await manager.stop()
+
+    @pytest.mark.asyncio
     async def test_push_text(self) -> None:
         ch = MockChannel(processor=_echo_processor)
         mgr = ChannelManager({ch.channel_id: ch}, workers_per_channel=1)

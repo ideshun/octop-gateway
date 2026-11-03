@@ -238,6 +238,13 @@ async def test_shared_group_policy_observes_unmentioned_humans_without_bypassing
     inbound = channel.parse_inbound(native)
     assert inbound.metadata["sender_is_bot"] is False
     assert inbound.metadata["bot_mentioned"] is False
+    assert inbound.metadata["has_mentions"] is False
+    directed = message(message_id=2, text="@Someone hello", entities=[entity("@Someone hello", "@Someone")])
+    native = await channel._build_message(directed)
+    assert native is not None
+    directed_inbound = channel.parse_inbound(native)
+    assert directed_inbound.metadata["has_mentions"] is True
+    assert directed_inbound.metadata["bot_mentioned"] is False
     assert channel.group_context_manager.prepare(inbound) is None
     config.allowed_user_ids = ["8"]
     assert not channel._accept(ordinary)
