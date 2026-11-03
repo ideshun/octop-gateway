@@ -84,6 +84,91 @@ def _qq_subject(subject_id: str, **metadata: str) -> ChannelSubject:
 class TestQQChannelUnit:
     """Unit tests for QQ channel logic (no API calls)."""
 
+    @pytest.mark.parametrize(
+        "event_type,target,own",
+        [
+            ("GROUP_MESSAGE_CREATE", "other", False),
+            ("GROUP_MESSAGE_CREATE", "test_qq_app_id", False),
+            ("GROUP_AT_MESSAGE_CREATE", "other", True),
+        ],
+    )
+    def test_group_mentions_retain_addressing_information(self, event_type: str, target: str, own: bool) -> None:
+        channel = QQChannel(processor=_noop_processor, config=QQConfig(app_id="test_qq_app_id", secret="offline"))
+        message = channel.parse_inbound(
+            {
+                "t": event_type,
+                "d": {
+                    "group_openid": "group",
+                    "author": {"member_openid": "member"},
+                    "content": "hello",
+                    "mentions": [{"id": target}],
+                },
+            }
+        )
+        assert message.metadata["has_mentions"] is True
+        assert message.metadata["bot_mentioned"] is own
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("structured", [False, True])
+    async def test_full_group_self_mention_uses_ready_user_identity(self, structured: bool) -> None:
+        channel = QQChannel(processor=_noop_processor, config=QQConfig(app_id="app", secret="offline"))
+        await channel._handle_op(
+            _SentWS(),
+            0,
+            {"op": 0, "t": "READY", "d": {"session_id": "session", "user": {"id": "bot-user"}}},
+        )
+        data = {
+            "group_openid": "group",
+            "author": {"member_openid": "member"},
+            "content": "<@other> <@bot-user> hello",
+        }
+        if structured:
+            data["mentions"] = [{"id": "other"}, {"id": "bot-user"}]
+        message = channel.parse_inbound({"t": "GROUP_MESSAGE_CREATE", "d": data})
+        assert message.metadata["bot_mentioned"] is True
+        assert message.metadata["has_mentions"] is True
+        assert message.text == "<@other> hello"
+
+        other = channel.parse_inbound(
+            {
+                "t": "GROUP_MESSAGE_CREATE",
+                "d": {**data, "content": "<@app> hello", "mentions": [{"id": "app"}]},
+            }
+        )
+        assert other.metadata["bot_mentioned"] is False
+        assert other.metadata["has_mentions"] is True
+        assert other.text == "<@app> hello"
+
+    def test_stripping_own_mention_preserves_other_targets(self) -> None:
+        channel = QQChannel(processor=_noop_processor, config=QQConfig(app_id="app", secret="offline"))
+        payload = {
+            "t": "GROUP_AT_MESSAGE_CREATE",
+            "d": {
+                "group_openid": "group",
+                "author": {"member_openid": "member"},
+                "content": "<@other> <@self> hello",
+                "mentions": [{"id": "self", "is_you": True}, {"id": "other"}],
+            },
+        }
+        message = channel.parse_inbound(payload)
+        assert message.text == "<@other> hello"
+        assert message.metadata["bot_mentioned"] is True
+
+    def test_at_event_does_not_imply_remaining_marker_is_the_bot(self) -> None:
+        channel = QQChannel(processor=_noop_processor, config=QQConfig(app_id="app", secret="offline"))
+        message = channel.parse_inbound(
+            {
+                "t": "GROUP_AT_MESSAGE_CREATE",
+                "d": {
+                    "group_openid": "group",
+                    "author": {"member_openid": "member"},
+                    "content": "<@other> hello",
+                },
+            }
+        )
+        assert message.metadata["bot_mentioned"] is True
+        assert message.text == "<@other> hello"
+
     def test_timestamp_rejects_ambiguous_local_time(self) -> None:
         from datetime import UTC, datetime
 
@@ -316,6 +401,7 @@ class TestQQChannelUnit:
 
     def test_parse_inbound_with_at_mention(self) -> None:
         ch = QQChannel(processor=_noop_processor, config=_make_config())
+        ch._bot_user_id = "12345"
         payload = {
             "t": "AT_MESSAGE_CREATE",
             "d": {
