@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Preserve QQ command text by separating quote metadata; quote current group turns with reliable indices and avoid Markdown fallback on uncertain delivery.
+
+
 - 通用入站策略开关与接管回调，保留适配器默认群策略；补齐 Discord、飞书、Telegram 的群消息身份和 @ 状态。
 - 控制命令可优先于普通会话队列处理，停止命令会取消同会话已排队的旧消息；QQ 提及元数据保留目标身份，避免把 @ 其他成员识别为 @ 机器人。
 
