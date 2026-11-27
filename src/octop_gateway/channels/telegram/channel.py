@@ -261,11 +261,16 @@ class TelegramChannel(BaseChannel):
 
     def _accept(self, message: Any) -> bool:
         shared = self._config.group_context.resolve(str(message.chat.id))
+        activation = self._config.group_activation
+        if shared.enabled and self.inbound_admission_enabled:
+            # Let the admission hook decide about passive group messages. Without
+            # a hook, preserve Telegram's configured activation policy.
+            activation = "always"
         return self._is_allowed_sender(message) and should_accept_message(
             message,
             bot_id=self._bot_id,
             bot_username=self._bot_username,
-            activation="always" if shared.enabled else self._config.group_activation,
+            activation=activation,
             allowed_user_ids=self._config.allowed_user_ids,
             allowed_chat_ids=self._config.allowed_chat_ids,
             allow_unaddressed_commands=self._config.allow_unaddressed_commands,
@@ -756,7 +761,7 @@ class TelegramChannel(BaseChannel):
             "sender_id": user_id,
             "sender_is_bot": data.get("sender_is_bot"),
             "bot_mentioned": data.get("bot_mentioned"),
-            "has_mentions": data.get("has_mentions"),
+            "has_mentions": bool(data.get("has_mentions")),
             "reply_to_bot": data.get("reply_to_is_own_bot") is True,
             "reply_to_message_id": data.get("reply_to_message_id"),
             "reply_to_text": data.get("reply_to_text", ""),
@@ -1025,7 +1030,7 @@ class TelegramChannel(BaseChannel):
             await close_event_stream(source)
 
     async def _preview(self, subject: ChannelSubject, state: dict[str, Any]) -> None:
-        if not self._app or state.get("disabled"):
+        if not self._app or state.get("disabled") or self._has_outbound_text_filter():
             return
         text = self._clean_output(state["text"]).encode("utf-16-le")[:8000].decode("utf-16-le", errors="ignore")
         if not text:

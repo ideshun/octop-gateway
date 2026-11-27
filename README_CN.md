@@ -210,6 +210,8 @@ MessageProcessor: InboundMessage → AsyncIterator[MessageEvent]
 
 ### 群命令权限（QQ 示例）
 
+Discord 群消息处理默认关闭；仅填写 `group_context.history_limit` 等部分选项不会开启群监听。显式设置 `group_context.enabled: true`，或启用明确的群插件开关，才会允许接收普通群消息。
+
 使用公共群策略的通道默认启用群内命令保护，Python 配置对象及未填写该字段的旧 JSON 配置也会启用。下面以 QQ 为例：
 
 ```json
@@ -282,4 +284,4 @@ make all              # 格式化 + 类型检查 + 测试
 
 ## 入站插件与 QQ 群资料
 
-宿主可注册逐条消息的前置处理钩子，并查询具备平台白名单权限的 QQ 群资料。接口、取消行为和频控见[使用说明](docs/inbound-admission.md)。
+宿主可注册逐条消息的前置钩子，通过受会话锁与权限检查保护的回调延迟派发，并查询具备平台白名单权限的 QQ 群资料。企业微信等已有自定义处理流程保持有效，接口、取消行为和频控见[使用说明](docs/inbound-admission.md)。

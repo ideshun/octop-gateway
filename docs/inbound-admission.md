@@ -12,17 +12,34 @@ async def admission(channel, message, dispatch):
 manager.set_inbound_handler(admission)
 ```
 
+Group ingestion is opt-in. Discord keeps `group_context.enabled` off when it is
+omitted or when a partial policy such as `history_limit` is supplied. An
+explicitly enabled plugin switch under `group_context` opts in unless
+`enabled` is explicitly set to `false`.
+
 The hook may retain `dispatch` for a bounded delayed task. Dispatch holds the
 channel/session lock and refuses removed or replaced channels and stopped
-managers. `activate=True` only activates groups with group policy enabled and
-visibility `all`; native sender checks and tool ceilings still apply. The host
-must cancel its plugin tasks before stopping the manager or unloading plugins.
+managers. Do not await a long-running `dispatch` inline in the hook: it keeps
+that worker occupied until the agent turn completes. Schedule bounded work and
+cancel plugin tasks before stopping the manager or unloading plugins.
+`activate=True` only activates groups with group policy enabled and visibility
+`all`; native sender checks and tool ceilings still apply.
 
 `InboundReceipt` records `attempted` and `delivered` separately. A send failure
 after an attempt is not proof of non-delivery; callers must not blindly resend.
 Cancellation propagates. Ordinary group input fails closed on hook errors;
 native commands, direct messages and mentions retain normal routing. The default
 without a hook preserves existing batching and routing behavior.
+
+The current dispatch receipt can be obtained with `current_inbound_receipt()`.
+
+`InboundReceipt.text_filter_finish` is an optional zero-argument callback returning an already-filtered text tail. The shared inbound template calls it only after successful processing, validates and cleans the result, and sends it without re-entering `text_filter`. Failure or cancellation never flushes a tail. Use it to release normal text buffered while recognizing a possible split marker. This callback applies to adapters using the shared template; custom delivery overrides must honor the same lifecycle explicitly.
+An admission handler may set its `input_filter` to accept or reject a prepared
+message, its `text_filter` to transform or suppress outbound text, and
+`suppress_thinking` to hide thinking for that dispatch. Filter exceptions fail
+closed. These callbacks are scoped to the dispatch and do not alter the
+channel's persistent settings. A retained `dispatch` can also receive an
+explicit `InboundReceipt` carrying these options.
 
 Hosts can call `set_priority_message_predicate(predicate)` for native commands
 that must not wait behind ordinary turns. These commands still pass group
@@ -40,13 +57,20 @@ preparation, processing and completion lifecycle.
 
 Group participation policies use the same hook across channel types. Adapters
 must provide stable subject and sender IDs plus explicit boolean
-`bot_mentioned` and `sender_is_bot` metadata. An adapter may instead expose
-`async resolve_sender_is_bot(message) -> bool | None`; unknown identities are
-not evidence of a human sender. Ordinary messages must reach the hook before
-the native activation check without bypassing sender or command permissions.
+`bot_mentioned` and `sender_is_bot` metadata. Adapters with platform mention
+data should also provide boolean `has_mentions`, meaning the message addresses
+any user, role, or everyone; it is independent of whether the bot itself was
+mentioned. An adapter may instead expose
+`async resolve_sender_is_bot(message) -> bool | None`; unknown sender identity
+is not evidence of a human sender. When an admission handler is installed and
+group policy is enabled, Telegram passes ordinary messages to the hook before
+its native activation check; without a handler, its configured activation policy
+remains in effect. Sender and command permissions are not bypassed.
 `BaseChannel.plugin_group_settings` exposes persisted boolean switches under
 `group_context`, including switches contributed by policy plugins; it does not
 change the platform's message access permissions.
+
+Delivery receipts track native `reply_*` sends in the current dispatch context; independent proactive pushes are not a receipt for this turn.
 
 Adapters should also set `has_mentions` before stripping addressing syntax.
 When it is true and `bot_mentioned` is false, the message addresses other

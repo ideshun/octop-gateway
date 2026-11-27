@@ -129,6 +129,8 @@ class ChannelManager:
         self._interrupt_message_predicate = interrupt_message_predicate
         self._priority_message_predicate: MessagePredicate | None = None
         self._inbound_handler = inbound_handler
+        for channel in self._channels.values():
+            channel._set_inbound_admission_enabled(inbound_handler is not None)
 
         # Per-channel queues and workers
         self._queues: dict[str, asyncio.Queue[Any]] = {}
@@ -160,6 +162,8 @@ class ChannelManager:
         Delayed dispatch keeps the session lock and refuses removed channels.
         """
         self._inbound_handler = handler
+        for channel in self._channels.values():
+            channel._set_inbound_admission_enabled(handler is not None)
 
     # =========================================================================
     # Lifecycle
@@ -189,6 +193,7 @@ class ChannelManager:
 
         # Initialize queues and set enqueue callbacks
         for channel_id, channel in self._channels.items():
+            channel._set_inbound_admission_enabled(self._inbound_handler is not None)
             queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=self._queue_maxsize)
             self._queues[channel_id] = queue
             channel.set_enqueue_callback(
@@ -716,6 +721,7 @@ class ChannelManager:
             raise ValueError(f"Channel already exists: {channel_id}")
 
         self._channels[channel_id] = channel
+        channel._set_inbound_admission_enabled(self._inbound_handler is not None)
         queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=self._queue_maxsize)
         self._queues[channel_id] = queue
         channel.set_enqueue_callback(lambda payload, cid=channel_id: self.enqueue(cid, payload))  # type: ignore[misc]
@@ -813,18 +819,21 @@ class ChannelManager:
             claimed = await handler(channel, message, dispatch)
             if not isinstance(claimed, bool):
                 raise TypeError("admission handlers must return bool")
-            if claimed:
-                channel.on_inbound_claimed(message)
-            return claimed
         except Exception:
             logger.warning("inbound admission handler failed: channel=%s", channel_id)
             # Ordinary group input fails closed. Native commands, DMs and
             # mentions retain routing when an optional plugin fails.
-            return (
+            claimed = (
                 channel.group_context_manager.handles(message)
                 and not message.metadata.get("bot_mentioned")
                 and not message.text.lstrip().startswith("/")
             )
+        if claimed:
+            try:
+                channel.on_inbound_claimed(message)
+            except Exception:
+                logger.warning("inbound claimed callback failed: channel=%s", channel_id)
+        return claimed
 
     async def _worker_loop(self, channel_id: str) -> None:
         """Worker loop: drain queue, batch same-session, process sequentially."""
@@ -1217,7 +1226,7 @@ class ChannelManager:
         processor: MessageProcessor | None = None,
         **kwargs: Any,
     ) -> str:
-        """Add a Slack channel (Socket Mode WebSocket & Web API)."""
+        """Add a Slack Bot channel (Socket Mode WebSocket or HTTP Events API)."""
         return await self.add_channel("slack", config, processor=processor, **kwargs)
 
     async def add_whatsapp_channel(
@@ -1227,5 +1236,5 @@ class ChannelManager:
         processor: MessageProcessor | None = None,
         **kwargs: Any,
     ) -> str:
-        """Add a WhatsApp channel (Meta Cloud API or WAHA / Evolution QR Bridge)."""
+        """Add a WhatsApp channel (Official Meta Cloud API or self-hosted WAHA/Evolution QR bridge)."""
         return await self.add_channel("whatsapp", config, processor=processor, **kwargs)

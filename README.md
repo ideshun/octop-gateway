@@ -246,7 +246,9 @@ caller's responsibility.
 
 `group_context` separates platform visibility from agent activation. QQ enables
 the shared manager by default with a conservative `auto + mention + recent(10)`
-policy. It can be configured globally and overridden by native group ID:
+policy. Discord keeps group ingestion disabled unless explicitly enabled; a
+partial `group_context` such as `history_limit` alone does not enable it. It can
+be configured globally and overridden by native group ID:
 
 ```json
 {
@@ -378,4 +380,4 @@ registration only, not running instances or persisted configuration.
 
 ## Pre-agent admission and QQ metadata
 
-Hosts can register per-message admission hooks and query QQ group metadata. See [contracts, permissions and limits](docs/inbound-admission.md).
+Hosts can register per-message admission hooks, use guarded delayed dispatch without changing native channel overrides, and query QQ group metadata. See [contracts, permissions and limits](docs/inbound-admission.md).
