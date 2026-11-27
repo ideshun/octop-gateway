@@ -102,8 +102,8 @@ _IMG_TAG_RE = re.compile(r"<qqimg\s+[^>]*?src\s*=\s*[\"']([^\"']+)[\"'][^>]*?>",
 _VIDEO_TAG_RE = re.compile(r"<qqvideo\s+[^>]*?src\s*=\s*[\"']([^\"']+)[\"'][^>]*?>", re.IGNORECASE)
 _AUDIO_TAG_RE = re.compile(r"<qqaudio\s+[^>]*?src\s*=\s*[\"']([^\"']+)[\"'][^>]*?>", re.IGNORECASE)
 _FILE_TAG_RE = re.compile(r"<qqfile\s+[^>]*?src\s*=\s*[\"']([^\"']+)[\"'][^>]*?>", re.IGNORECASE)
-# Detect addressing before confirmed self mentions are stripped.
-_AT_MENTION_RE = re.compile(r"<@!?[^>]+>")
+# Detect QQ @ markers before removing mentions confirmed to target this bot.
+_AT_MENTION_RE = re.compile(r"<@!?[^>]+>", re.IGNORECASE)
 _THINK_BLOCK_RE = re.compile(
     r"<(?:think|thinking)>(.*?)</(?:think|thinking)>",
     re.IGNORECASE | re.DOTALL,
@@ -243,11 +243,7 @@ class QQConfig(ChannelConfig):
             # ``c2c_streaming: false`` remains the only opt-out.
             config.c2c_streaming = True
         raw_group_context = data.get("group_context")
-        config.plugin_group_settings = {}
         if isinstance(raw_group_context, dict):
-            config.plugin_group_settings = {
-                key: value for key, value in raw_group_context.items() if isinstance(key, str) and type(value) is bool
-            }
             social_trigger_enabled = raw_group_context.get("social_trigger_enabled", True)
             if type(social_trigger_enabled) is not bool:
                 raise ValueError("social_trigger_enabled must be a boolean")
@@ -297,7 +293,7 @@ class QQChannel(BaseChannel):
 
     @property
     def plugin_group_settings(self) -> dict[str, bool]:
-        """Return a copy of the QQ group-policy switches available to plugins."""
+        """A copy of boolean QQ group-policy options for loaded plugins."""
         return self._config.plugin_group_settings.copy()
 
     def __init__(
@@ -673,7 +669,10 @@ class QQChannel(BaseChannel):
         inbound_msg_id = str(meta.get("msg_id") or "")
 
         async def _send_frame(frame: StreamFrame) -> str | None:
-            return await self._send_stream_frame(frame)
+            self._mark_receipt_attempted()
+            stream_id = await self._send_stream_frame(frame)
+            self._mark_receipt_delivered()
+            return stream_id
 
         session = StreamSession(
             user_id=user_id,
@@ -683,19 +682,18 @@ class QQChannel(BaseChannel):
             send_frame=_send_frame,
         )
         self._active_c2c_stream = session
-        text_parts: list[str] = []
+        raw_text_parts: list[str] = []
+        filtered_text_parts: list[str] = []
         answer_prefix = ""
         thinking_parts: list[str] = []
         media_buffer: list[ContentPart] = []
         processing_succeeded = False
-        show_thinking = self._constraints.show_thinking
+        filter_failed = False
+        show_thinking = self.should_show_thinking()
         show_tool_hints = self._constraints.show_tool_hints
 
-        def _full_text() -> str:
-            return "".join(text_parts)
-
         def _answer_text() -> str:
-            return strip_think_tags(_full_text())
+            return strip_think_tags("".join(filtered_text_parts))
 
         def _format_thinking(content: str) -> str:
             template = self._constraints.thinking_template
@@ -709,6 +707,18 @@ class QQChannel(BaseChannel):
                 return ""
             return _format_thinking(raw)
 
+        def _append_visible_chunk(chunk: str) -> None:
+            nonlocal filter_failed
+            if not chunk or filter_failed:
+                return
+            raw_text_parts.append(chunk)
+            filtered = self._filter_outbound_text(chunk, clean=False)
+            if filtered is None:
+                filter_failed = True
+                return
+            if filtered:
+                filtered_text_parts.append(filtered)
+
         def _ingest_body_text(raw: str) -> None:
             if not raw:
                 return
@@ -717,7 +727,7 @@ class QQChannel(BaseChannel):
                 thinking_parts.append(extracted)
             visible = strip_think_tags(raw)
             if visible:
-                text_parts.append(visible)
+                _append_visible_chunk(visible)
 
         def _locked_stream_text(text: str) -> str:
             text = answer_prefix + text
@@ -727,9 +737,9 @@ class QQChannel(BaseChannel):
             return reconcile_stream_text(accepted, text)
 
         def _offer_answer(*, final: bool = False) -> None:
-            text = _answer_text()
-            if session.failed or session.closing:
+            if filter_failed or session.failed or session.closing:
                 return
+            text = _answer_text()
             payload = text if final else stable_markdown_prefix(text)
             if not payload:
                 return
@@ -751,12 +761,20 @@ class QQChannel(BaseChannel):
             name="qq-c2c-stream-typing",
         )
 
-        async def _deliver_static(text: str) -> None:
-            cleaned = (text or "").strip()
-            if not cleaned:
-                return
+        async def _deliver_static(text: str, *, apply_filter: bool = True) -> None:
+            if apply_filter:
+                filtered = self._filter_outbound_text(text, clean=True)
+                if not filtered or not filtered.strip():
+                    return
+                cleaned = filtered.strip()
+            else:
+                cleaned = (text or "").strip()
+                if not cleaned:
+                    return
             try:
+                self._mark_receipt_attempted()
                 await self._send_text(subject, cleaned)
+                self._mark_receipt_delivered()
             except Exception:  # pylint: disable=broad-except
                 # Preserve the stream fallback when a static platform send fails.
                 logger.warning(
@@ -766,7 +784,7 @@ class QQChannel(BaseChannel):
                 )
 
         async def _flush_thinking() -> None:
-            if not show_thinking:
+            if not show_thinking or filter_failed:
                 thinking_parts.clear()
                 return
             text = _thinking_text()
@@ -793,15 +811,17 @@ class QQChannel(BaseChannel):
                         await _flush_thinking()
                     extra = strip_think_tags(extra)
                     if extra:
-                        current = _full_text()
-                        if not current:
-                            text_parts.append(extra)
-                        elif extra.startswith(current) or current.startswith(extra):
-                            if len(extra) > len(current):
-                                text_parts.clear()
-                                text_parts.append(extra)
+                        raw_current = "".join(raw_text_parts)
+                        if not raw_current:
+                            _append_visible_chunk(extra)
+                        elif extra.startswith(raw_current):
+                            suffix = extra[len(raw_current) :]
+                            if suffix:
+                                _append_visible_chunk(suffix)
+                        elif raw_current.startswith(extra):
+                            pass
                         else:
-                            text_parts.append(extra)
+                            _append_visible_chunk(extra)
                     _offer_answer()
                     media_buffer.extend(extract_media(event.content))
                 elif event.type == MessageEventType.THINKING_DELTA:
@@ -818,17 +838,18 @@ class QQChannel(BaseChannel):
                         await _flush_thinking()
                 elif event.type == MessageEventType.TOOL_START:
                     await _flush_thinking()
-                    text_parts.clear()
+                    raw_text_parts.clear()
+                    filtered_text_parts.clear()
                     session.discard_unsent()
                     # QQ cannot remove accepted or in-flight narration. Freeze
                     # that prefix once so each new answer snapshot extends it.
                     answer_prefix = session._prefix_base()
-                    if show_tool_hints:
+                    if show_tool_hints and not filter_failed:
                         hint = tool_hint_message(event.metadata, self._constraints, phase="start")
                         if hint:
                             await _deliver_static(hint)
                 elif event.type == MessageEventType.TOOL_END:
-                    if show_tool_hints:
+                    if show_tool_hints and not filter_failed:
                         hint = tool_hint_message(event.metadata, self._constraints, phase="end")
                         if hint:
                             await _deliver_static(hint)
@@ -841,17 +862,34 @@ class QQChannel(BaseChannel):
                     break
                 elif event.type in (MessageEventType.TYPING, MessageEventType.FLUSH):
                     continue
+            if processing_succeeded and not filter_failed:
+                tail = self._finish_outbound_text_filter(clean=False)
+                if tail is None:
+                    filter_failed = True
+                elif tail:
+                    filtered_text_parts.append(tail)
+            elif processing_succeeded and filter_failed:
+                self._suppress_outbound_text_filter_finish()
+
+            if filter_failed:
+                await session.finish(session.last_accepted, discard_pending=True)
+                return False
+
             answer = _answer_text()
-            _offer_answer(final=True)
-            locked = _locked_stream_text(answer) if answer else session.last_accepted
-            await session.finish(locked)
+            if not answer.strip() and session.sent_frames <= 0 and not (session.pending or "").strip():
+                session.closing = True
+                session.pending = None
+            else:
+                _offer_answer(final=True)
+                locked = _locked_stream_text(answer) if answer else session.last_accepted
+                await session.finish(locked)
             await _flush_thinking()
             # Hold-only frames are not visible. Fall back when nothing
             # readable was accepted, even if sent_frames > 0. An unlinked
             # visible frame cannot be replaced, so the finished answer is
             # delivered once as a normal message instead of more stream frames.
-            if session.unlinked or session.sent_frames <= 0 or not session.last_accepted.strip():
-                await _deliver_static(answer)
+            if answer.strip() and (session.unlinked or session.sent_frames <= 0 or not session.last_accepted.strip()):
+                await _deliver_static(answer, apply_filter=False)
             for media in media_buffer:
                 await self.reply_media(subject, media)
             return processing_succeeded
@@ -864,10 +902,7 @@ class QQChannel(BaseChannel):
             )
             with contextlib.suppress(Exception):
                 await session.finish(session.last_accepted, discard_pending=True)
-            await self._send_text(
-                subject,
-                "An error occurred while processing your message.",
-            )
+            await _deliver_static("An error occurred while processing your message.")
             return False
         finally:
             typing_until_visible.cancel()
@@ -1131,10 +1166,12 @@ class QQChannel(BaseChannel):
             metadata["sender_is_bot"] = sender["bot"]
         if is_group:
             metadata["conversation_id"] = conversation_id
-            metadata["bot_mentioned"] = self._is_bot_mentioned(data, event_type)
+            bot_mentioned = self._is_bot_mentioned(data, event_type)
+            metadata["bot_mentioned"] = bot_mentioned
+            mentions = data.get("mentions")
             metadata["has_mentions"] = bool(
-                metadata["bot_mentioned"]
-                or data.get("mentions")
+                bot_mentioned
+                or (isinstance(mentions, list) and mentions)
                 or _AT_MENTION_RE.search(str(data.get("content") or ""))
             )
 
@@ -1302,7 +1339,7 @@ class QQChannel(BaseChannel):
             if event_type == "READY":
                 self._session_id_ws = data.get("session_id")
                 user = data.get("user")
-                self._bot_user_id = str(user.get("id") or "") if isinstance(user, dict) else ""
+                self._bot_user_id = str(user.get("id") or "") if isinstance(user, dict) else None
                 # Reconnect succeeded all the way through IDENTIFY → reset
                 # the geometric backoff so a healthy session doesn't carry
                 # an inflated delay from prior failures.
@@ -1848,7 +1885,7 @@ class QQChannel(BaseChannel):
         return voice_transcripts
 
     def _bot_mention_ids(self, data: dict[str, object]) -> set[str]:
-        """Use authenticated user identity and event-local self markers, never AppID."""
+        """Use the authenticated bot identity and event-local self markers, never AppID."""
         bot_ids = {self._bot_user_id} if self._bot_user_id else set()
         mentions = data.get("mentions")
         if isinstance(mentions, list):
@@ -1867,7 +1904,6 @@ class QQChannel(BaseChannel):
         for bot_id in self._bot_mention_ids(data):
             token = re.compile(rf"<@!?{re.escape(bot_id)}>\s*", re.IGNORECASE)
             clean = token.sub("", clean)
-
         return clean.strip()
 
     @staticmethod
@@ -2041,7 +2077,8 @@ class QQChannel(BaseChannel):
                     continue
                 if mention.get("is_you") is True:
                     return True
-                if any(str(mention.get(key) or "") in bot_ids for key in ("id", "user_openid", "member_openid")):
+                mention_id = mention.get("id") or mention.get("user_openid") or mention.get("member_openid")
+                if mention_id is not None and str(mention_id) in bot_ids:
                     return True
         content = str(data.get("content") or "")
         return any(f"<@!{bot_id}>" in content or f"<@{bot_id}>" in content for bot_id in bot_ids)

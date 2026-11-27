@@ -50,6 +50,18 @@ from octop_gateway.utils import Debouncer, close_event_stream, extract_media, ex
 
 logger = logging.getLogger(__name__)
 
+_GROUP_CONTEXT_FIELDS = frozenset(item.name for item in fields(GroupContextConfig))
+
+
+def _plugin_group_settings(data: dict[str, Any]) -> dict[str, bool]:
+    """Extract plugin switches without exposing core group-policy booleans."""
+    return {
+        key: value
+        for key, value in data.items()
+        if key not in _GROUP_CONTEXT_FIELDS and isinstance(key, str) and type(value) is bool
+    }
+
+
 # Type alias for the message processor: takes InboundMessage, yields MessageEvents
 MessageProcessor = Callable[[InboundMessage], AsyncIterator[MessageEvent]]
 
@@ -64,6 +76,7 @@ class InboundReceipt:
     input_filter: Callable[[InboundMessage], bool] | None = field(default=None, repr=False, compare=False)
     suppress_thinking: bool = False
     text_filter_finish: Callable[[], str] | None = field(default=None, repr=False, compare=False)
+    _text_filter_finished: bool = field(default=False, init=False, repr=False, compare=False)
 
 
 _inbound_receipt: ContextVar[InboundReceipt | None] = ContextVar("inbound_receipt", default=None)
@@ -154,10 +167,13 @@ class ChannelConfig:
         if isinstance(group_context, dict):
             group_field = next(item for item in fields(cls) if item.name == "group_context")
             defaults = asdict(group_field.default_factory())  # type: ignore[misc]
+            plugin_settings = _plugin_group_settings(group_context)
+            if "enabled" not in group_context and any(plugin_settings.values()):
+                # An explicitly enabled plugin switch opts into group ingestion;
+                # unrelated partial policy fields keep the adapter's safe default.
+                defaults["enabled"] = True
             out["group_context"] = GroupContextConfig.from_dict({**defaults, **group_context})
-            out["plugin_group_settings"] = {
-                key: value for key, value in group_context.items() if isinstance(key, str) and type(value) is bool
-            }
+            out["plugin_group_settings"] = plugin_settings
         for alias, canonical in cls.field_aliases.items():  # type: ignore[attr-defined]
             if canonical in known and not out.get(canonical) and data.get(alias):
                 out[canonical] = _clean(data[alias])
@@ -266,6 +282,7 @@ class BaseChannel(ABC):
         self._http: aiohttp.ClientSession | None = None
         # Set by ChannelManager
         self._enqueue_callback: Callable[[Any], None] | None = None
+        self._inbound_admission_enabled = False
         self._group_context = GroupContextManager(config.group_context if config is not None else None)
         self._plugin_group_settings = dict(config.plugin_group_settings) if config is not None else {}
 
@@ -351,6 +368,14 @@ class BaseChannel(ABC):
     def plugin_group_settings(self) -> dict[str, bool]:
         """Return persisted switches contributed by inbound policy plugins."""
         return self._plugin_group_settings.copy()
+
+    @property
+    def inbound_admission_enabled(self) -> bool:
+        """Whether the manager has installed a pre-agent admission handler."""
+        return self._inbound_admission_enabled
+
+    def _set_inbound_admission_enabled(self, enabled: bool) -> None:
+        self._inbound_admission_enabled = enabled
 
     def on_inbound_claimed(self, message: InboundMessage) -> None:
         """Release transport intake after a policy plugin owns this input.
@@ -828,20 +853,12 @@ class BaseChannel(ABC):
         if prepared is not None:
             message, subject = prepared
             processing_succeeded = await self._process_inbound(message, subject)
-            receipt = current_inbound_receipt()
-            if processing_succeeded and receipt is not None and receipt.text_filter_finish is not None:
-                try:
-                    tail = receipt.text_filter_finish()
-                    if not isinstance(tail, str):
-                        raise TypeError("inbound text filter finish must return str")
-                except Exception:  # pylint: disable=broad-except
-                    logger.warning("inbound text filter finish failed; reply suppressed")
-                else:
-                    tail = self._clean_output(tail)
-                    if tail.strip():
-                        # The callback has already filtered this tail. Do not feed
-                        # it back into the filter and buffer the same text again.
-                        await self.reply_text(subject, tail)
+            if processing_succeeded:
+                tail = self._finish_outbound_text_filter(clean=True)
+                if tail and tail.strip():
+                    # The callback has already filtered this tail. Do not feed
+                    # it back into the filter and buffer the same text again.
+                    await self.reply_text(subject, tail)
             self._finalize_inbound(message, processing_succeeded=processing_succeeded)
 
     async def dispatch_inbound(
@@ -1073,6 +1090,71 @@ class BaseChannel(ABC):
                 await close_event_stream(events)
         return processing_succeeded
 
+    @staticmethod
+    def _mark_receipt_attempted() -> None:
+        receipt = _inbound_receipt.get()
+        if receipt is not None:
+            receipt.attempted = True
+
+    @staticmethod
+    def _mark_receipt_delivered() -> None:
+        receipt = _inbound_receipt.get()
+        if receipt is not None:
+            receipt.delivered = True
+
+    @staticmethod
+    def _has_outbound_text_filter() -> bool:
+        receipt = _inbound_receipt.get()
+        return receipt is not None and (receipt.text_filter is not None or receipt.text_filter_finish is not None)
+
+    @staticmethod
+    def _suppress_outbound_text_filter_finish() -> None:
+        receipt = _inbound_receipt.get()
+        if receipt is not None:
+            receipt._text_filter_finished = True
+
+    def _filter_outbound_text(self, text: str, *, clean: bool = True) -> str | None:
+        """Apply optional cleaning and per-dispatch text filtering (fail-closed).
+
+        Returns ``None`` when ``text_filter`` raises or returns a non-``str``
+        value so callers can suppress raw output instead of leaking it.
+        """
+        if clean:
+            text = self._clean_output(text)
+        if not text:
+            return ""
+        receipt = _inbound_receipt.get()
+        text_filter = getattr(receipt, "text_filter", None)
+        if text_filter is None:
+            return text
+        try:
+            filtered = text_filter(text)
+            if not isinstance(filtered, str):
+                raise TypeError("inbound text filter must return str")
+        except Exception:  # pylint: disable=broad-except
+            logger.warning("inbound text filter failed; reply suppressed")
+            return None
+        return filtered
+
+    def _finish_outbound_text_filter(self, *, clean: bool = True) -> str | None:
+        """Run ``InboundReceipt.text_filter_finish`` at most once per dispatch.
+
+        Returns ``""`` when no callback is configured or it was already
+        consumed, or ``None`` when the callback raises or returns a non-``str``.
+        """
+        receipt = _inbound_receipt.get()
+        if receipt is None or receipt.text_filter_finish is None or receipt._text_filter_finished:
+            return ""
+        receipt._text_filter_finished = True
+        try:
+            tail = receipt.text_filter_finish()
+            if not isinstance(tail, str):
+                raise TypeError("inbound text filter finish must return str")
+        except Exception:  # pylint: disable=broad-except
+            logger.warning("inbound text filter finish failed; reply suppressed")
+            return None
+        return self._clean_output(tail) if clean else tail
+
     async def _rate_limited_send(self, subject: ChannelSubject, text: str) -> None:
         """Clean output and dispatch via :meth:`reply_text`.
 
@@ -1081,20 +1163,10 @@ class BaseChannel(ABC):
         is applied first so empty results short-circuit before consuming a
         rate-limit slot.
         """
-        text = self._clean_output(text)
-        receipt = _inbound_receipt.get()
-        text_filter = getattr(receipt, "text_filter", None)
-        if text and text_filter is not None:
-            try:
-                text = text_filter(text)
-                if not isinstance(text, str):
-                    raise TypeError("inbound text filter must return str")
-            except Exception:  # pylint: disable=broad-except
-                logger.warning("inbound text filter failed; reply suppressed")
-                return
-        if not text.strip():
+        filtered = self._filter_outbound_text(text, clean=True)
+        if not filtered or not filtered.strip():
             return
-        await self.reply_text(subject, text)
+        await self.reply_text(subject, filtered)
 
     def _clean_output(self, text: str) -> str:
         """Legacy fallback: strip/format <think> tags in raw model output.
@@ -1219,7 +1291,7 @@ class BaseChannel(ABC):
 
         Only sends if show_thinking=True. Formats with thinking_template.
         """
-        if not self._constraints.show_thinking:
+        if not self.should_show_thinking():
             return
         for part in event.content:
             if isinstance(part, TextContent) and part.text:
